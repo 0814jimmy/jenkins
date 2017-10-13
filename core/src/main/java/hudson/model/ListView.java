@@ -28,6 +28,9 @@ import hudson.Extension;
 import hudson.Util;
 import hudson.diagnosis.OldDataMonitor;
 import hudson.model.Descriptor.FormException;
+import hudson.model.listeners.ItemListener;
+import hudson.security.ACL;
+import hudson.security.ACLContext;
 import hudson.util.CaseInsensitiveComparator;
 import hudson.util.DescribableList;
 import hudson.util.FormValidation;
@@ -36,21 +39,25 @@ import hudson.views.ListViewColumn;
 import hudson.views.ViewJobFilter;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.SortedSet;
-import java.util.TreeSet;
+import java.util.*;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
+import javax.annotation.CheckForNull;
 import javax.annotation.concurrent.GuardedBy;
 import javax.servlet.ServletException;
+import jenkins.model.Jenkins;
+import jenkins.model.ParameterizedJobMixIn;
 
 import net.sf.json.JSONObject;
+import org.jenkinsci.Symbol;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
@@ -62,7 +69,7 @@ import org.kohsuke.stapler.interceptor.RequirePOST;
  *
  * @author Kohsuke Kawaguchi
  */
-public class ListView extends View implements Saveable {
+public class ListView extends View implements DirectlyModifiableView {
 
     /**
      * List of job names. This is what gets serialized.
@@ -107,6 +114,14 @@ public class ListView extends View implements Saveable {
         this.owner = owner;
     }
 
+    /**
+     * Sets the columns of this view.
+     */
+    @DataBoundSetter
+    public void setColumns(List<ListViewColumn> columns) throws IOException {
+        this.columns.replaceBy(columns);
+    }
+
     private Object readResolve() {
         if(includeRegex!=null) {
             try {
@@ -116,8 +131,10 @@ public class ListView extends View implements Saveable {
                 OldDataMonitor.report(this, Collections.<Throwable>singleton(x));
             }
         }
-        if (jobNames == null) {
-            jobNames = new TreeSet<String>(CaseInsensitiveComparator.INSTANCE);
+        synchronized(this) {
+            if (jobNames == null) {
+                jobNames = new TreeSet<String>(CaseInsensitiveComparator.INSTANCE);
+            }
         }
         initColumns();
         initJobFilters();
@@ -126,7 +143,9 @@ public class ListView extends View implements Saveable {
 
     protected void initColumns() {
         if (columns == null)
-            columns = new DescribableList<ListViewColumn, Descriptor<ListViewColumn>>(this,ListViewColumn.createDefaultInitialColumnList());
+            columns = new DescribableList<ListViewColumn, Descriptor<ListViewColumn>>(this,
+                    ListViewColumn.createDefaultInitialColumnList(getClass())
+            );
     }
 
     protected void initJobFilters() {
@@ -145,6 +164,7 @@ public class ListView extends View implements Saveable {
     	return jobFilters;
     }
 
+    @Override
     public DescribableList<ListViewColumn, Descriptor<ListViewColumn>> getColumns() {
         return columns;
     }
@@ -156,6 +176,7 @@ public class ListView extends View implements Saveable {
      * This method returns a separate copy each time to avoid
      * concurrent modification issue.
      */
+    @Override
     public List<TopLevelItem> getItems() {
         SortedSet<String> names;
         List<TopLevelItem> items = new ArrayList<TopLevelItem>();
@@ -164,21 +185,29 @@ public class ListView extends View implements Saveable {
             names = new TreeSet<String>(jobNames);
         }
 
-        ItemGroup<? extends TopLevelItem> parent = getOwnerItemGroup();
-        includeItems(parent, names);
+        ItemGroup<? extends TopLevelItem> parent = getOwner().getItemGroup();
+        List<TopLevelItem> parentItems = new ArrayList<TopLevelItem>(parent.getItems());
+        includeItems(parent, parentItems, names);
 
         Boolean statusFilter = this.statusFilter; // capture the value to isolate us from concurrent update
-        for (TopLevelItem item : Items.getAllItems(getOwnerItemGroup(), TopLevelItem.class)) {
-            if (!names.contains(item.getRelativeNameFrom(getOwnerItemGroup()))) continue;
+        Iterable<? extends TopLevelItem> candidates;
+        if (recurse) {
+            candidates = Items.getAllItems(parent, TopLevelItem.class);
+        } else {
+            candidates = parent.getItems();
+        }
+        for (TopLevelItem item : candidates) {
+            if (!names.contains(item.getRelativeNameFrom(getOwner().getItemGroup()))) continue;
             // Add if no status filter or filter matches enabled/disabled status:
-            if(statusFilter == null || !(item instanceof AbstractProject)
-                              || ((AbstractProject)item).isDisabled() ^ statusFilter)
+            if(statusFilter == null || !(item instanceof ParameterizedJobMixIn.ParameterizedJob) // TODO or better to call the more generic Job.isBuildable?
+                              || ((ParameterizedJobMixIn.ParameterizedJob)item).isDisabled() ^ statusFilter)
                 items.add(item);
         }
 
         // check the filters
         Iterable<ViewJobFilter> jobFilters = getJobFilters();
-        List<TopLevelItem> allItems = new ArrayList<TopLevelItem>(parent.getItems());
+        List<TopLevelItem> allItems = new ArrayList<TopLevelItem>(parentItems);
+        if (recurse) allItems = expand(allItems, new ArrayList<TopLevelItem>());
     	for (ViewJobFilter jobFilter: jobFilters) {
     		items = jobFilter.filter(items, allItems, this);
     	}
@@ -187,22 +216,29 @@ public class ListView extends View implements Saveable {
         
         return items;
     }
+
+    private List<TopLevelItem> expand(Collection<TopLevelItem> items, List<TopLevelItem> allItems) {
+        for (TopLevelItem item : items) {
+            if (item instanceof ItemGroup) {
+                ItemGroup<? extends Item> ig = (ItemGroup<? extends Item>) item;
+                expand(Util.filter(ig.getItems(), TopLevelItem.class), allItems);
+            }
+            allItems.add(item);
+        }
+        return allItems;
+    }
     
     @Override
     public boolean contains(TopLevelItem item) {
       return getItems().contains(item);
     }
     
-    private void includeItems(ItemGroup<? extends TopLevelItem> parent, SortedSet<String> names) {
-        includeItems(parent, parent, names);
-    }
-    
-    private void includeItems(ItemGroup<? extends TopLevelItem> root, ItemGroup<?> parent, SortedSet<String> names) {
+    private void includeItems(ItemGroup<? extends TopLevelItem> root, Collection<? extends Item> parentItems, SortedSet<String> names) {
         if (includePattern != null) {
-            for (Item item : parent.getItems()) {
+            for (Item item : parentItems) {
                 if (recurse && item instanceof ItemGroup) {
                     ItemGroup<?> ig = (ItemGroup<?>) item;
-                    includeItems(root, ig, names);
+                    includeItems(root, ig.getItems(), names);
                 }
                 if (item instanceof TopLevelItem) {
                     String itemName = item.getRelativeNameFrom(root);
@@ -216,21 +252,35 @@ public class ListView extends View implements Saveable {
     
     public synchronized boolean jobNamesContains(TopLevelItem item) {
         if (item == null) return false;
-        return jobNames.contains(item.getRelativeNameFrom(getOwnerItemGroup()));
+        return jobNames.contains(item.getRelativeNameFrom(getOwner().getItemGroup()));
     }
-
-    
 
     /**
      * Adds the given item to this view.
      *
      * @since 1.389
      */
+    @Override
     public void add(TopLevelItem item) throws IOException {
         synchronized (this) {
-            jobNames.add(item.getRelativeNameFrom(getOwnerItemGroup()));
+            jobNames.add(item.getRelativeNameFrom(getOwner().getItemGroup()));
         }
         save();
+    }
+
+    /**
+     * Removes given item from this view.
+     *
+     * @since 1.566
+     */
+    @Override
+    public boolean remove(TopLevelItem item) throws IOException {
+        synchronized (this) {
+            String name = item.getRelativeNameFrom(getOwner().getItemGroup());
+            if (!jobNames.remove(name)) return false;
+        }
+        save();
+        return true;
     }
 
     public String getIncludeRegex() {
@@ -241,10 +291,10 @@ public class ListView extends View implements Saveable {
         return recurse;
     }
     
-    /*
-     * For testing purposes
+    /**
+     * @since 1.568
      */
-    void setRecurse(boolean recurse) {
+    public void setRecurse(boolean recurse) {
         this.recurse = recurse;
     }
 
@@ -256,52 +306,95 @@ public class ListView extends View implements Saveable {
         return statusFilter;
     }
 
+    /**
+     * Determines the initial state of the checkbox.
+     *
+     * @return true when the view is empty or already contains jobs specified by name.
+     */
+    @Restricted(NoExternalUse.class) // called from newJob_button-bar view
+    @SuppressWarnings("unused") // called from newJob_button-bar view
+    public boolean isAddToCurrentView() {
+        synchronized(this) {
+            return !jobNames.isEmpty() || // There are already items in this view specified by name
+                    (jobFilters.isEmpty() && includePattern == null) // No other way to include items is used
+                    ;
+        }
+    }
+
+    private boolean needToAddToCurrentView(StaplerRequest req) throws ServletException {
+        String json = req.getParameter("json");
+        if (json != null && json.length() > 0) {
+            // Submitted via UI
+            JSONObject form = req.getSubmittedForm();
+            return form.has("addToCurrentView") && form.getBoolean("addToCurrentView");
+        } else {
+            // Submitted via API
+            return true;
+        }
+    }
+
+    @Override
+    @RequirePOST
     public Item doCreateItem(StaplerRequest req, StaplerResponse rsp) throws IOException, ServletException {
-        ItemGroup<? extends TopLevelItem> ig = getOwnerItemGroup();
+        ItemGroup<? extends TopLevelItem> ig = getOwner().getItemGroup();
         if (ig instanceof ModifiableItemGroup) {
             TopLevelItem item = ((ModifiableItemGroup<? extends TopLevelItem>)ig).doCreateItem(req, rsp);
-            if(item!=null) {
-                synchronized (this) {
-                    jobNames.add(item.getRelativeNameFrom(getOwnerItemGroup()));
+            if (item!=null) {
+                if (needToAddToCurrentView(req)) {
+                    synchronized (this) {
+                        jobNames.add(item.getRelativeNameFrom(getOwner().getItemGroup()));
+                    }
+                    owner.save();
                 }
-                owner.save();
             }
             return item;
         }
         return null;
     }
 
+    @Override
     @RequirePOST
     public HttpResponse doAddJobToView(@QueryParameter String name) throws IOException, ServletException {
         checkPermission(View.CONFIGURE);
         if(name==null)
             throw new Failure("Query parameter 'name' is required");
 
-        if (getOwnerItemGroup().getItem(name) == null)
+        TopLevelItem item = resolveName(name);
+        if (item == null)
             throw new Failure("Query parameter 'name' does not correspond to a known item");
 
-        if (jobNames.add(name))
-            owner.save();
+        if (contains(item)) return HttpResponses.ok();
+
+        add(item);
+        owner.save();
 
         return HttpResponses.ok();
     }
 
+    @Override
     @RequirePOST
     public HttpResponse doRemoveJobFromView(@QueryParameter String name) throws IOException, ServletException {
         checkPermission(View.CONFIGURE);
         if(name==null)
             throw new Failure("Query parameter 'name' is required");
 
-        if (jobNames.remove(name))
+        TopLevelItem item = resolveName(name);
+        if (item==null)
+            throw new Failure("Query parameter 'name' does not correspond to a known and readable item");
+
+        if (remove(item))
             owner.save();
 
         return HttpResponses.ok();
     }
 
-    @Override
-    public synchronized void onJobRenamed(Item item, String oldName, String newName) {
-        if(jobNames.remove(oldName) && newName!=null)
-            jobNames.add(newName);
+    private @CheckForNull TopLevelItem resolveName(String name) {
+        TopLevelItem item = getOwner().getItemGroup().getItem(name);
+        if (item == null) {
+            name = Items.getCanonicalName(getOwner().getItemGroup(), name);
+            item = Jenkins.getInstance().getItemByFullName(name, TopLevelItem.class);
+        }
+        return item;
     }
 
     /**
@@ -317,28 +410,19 @@ public class ListView extends View implements Saveable {
             jobNames.clear();
             Iterable<? extends TopLevelItem> items;
             if (recurse) {
-                items = Items.getAllItems(getOwnerItemGroup(), TopLevelItem.class);
+                items = Items.getAllItems(getOwner().getItemGroup(), TopLevelItem.class);
             } else {
-                items = getOwnerItemGroup().getItems();
+                items = getOwner().getItemGroup().getItems();
             }
             for (TopLevelItem item : items) {
-                String relativeNameFrom = item.getRelativeNameFrom(getOwnerItemGroup());
+                String relativeNameFrom = item.getRelativeNameFrom(getOwner().getItemGroup());
                 if(req.getParameter(relativeNameFrom)!=null) {
                     jobNames.add(relativeNameFrom);
                 }
             }
         }
 
-        if (req.getParameter("useincluderegex") != null) {
-            includeRegex = Util.nullify(req.getParameter("includeRegex"));
-            if (includeRegex == null)
-                includePattern = null;
-            else
-                includePattern = Pattern.compile(includeRegex);
-        } else {
-            includeRegex = null;
-            includePattern = null;
-        }
+        setIncludeRegex(req.getParameter("useincluderegex") != null ? req.getParameter("includeRegex") : null);
 
         if (columns == null) {
             columns = new DescribableList<ListViewColumn,Descriptor<ListViewColumn>>(this);
@@ -353,9 +437,19 @@ public class ListView extends View implements Saveable {
         String filter = Util.fixEmpty(req.getParameter("statusFilter"));
         statusFilter = filter != null ? "1".equals(filter) : null;
     }
+    
+    /** @since 1.526 */
+    public void setIncludeRegex(String includeRegex) {
+        this.includeRegex = Util.nullify(includeRegex);
+        if (this.includeRegex == null)
+            this.includePattern = null;
+        else
+            this.includePattern = Pattern.compile(includeRegex);
+    }
 
-    @Extension
+    @Extension @Symbol("list")
     public static class DescriptorImpl extends ViewDescriptor {
+        @Override
         public String getDisplayName() {
             return Messages.ListView_DisplayName();
         }
@@ -380,7 +474,96 @@ public class ListView extends View implements Saveable {
      * @deprecated as of 1.391
      *  Use {@link ListViewColumn#createDefaultInitialColumnList()}
      */
+    @Deprecated
     public static List<ListViewColumn> getDefaultColumns() {
-        return ListViewColumn.createDefaultInitialColumnList();
+        return ListViewColumn.createDefaultInitialColumnList(ListView.class);
     }
+
+    @Restricted(NoExternalUse.class)
+    @Extension
+    public static final class Listener extends ItemListener {
+        @Override
+        public void onLocationChanged(final Item item, final String oldFullName, final String newFullName) {
+            try (ACLContext _ = ACL.as(ACL.SYSTEM)) {
+                locationChanged(item, oldFullName, newFullName);
+            }
+        }
+        private void locationChanged(Item item, String oldFullName, String newFullName) {
+            final Jenkins jenkins = Jenkins.getInstance();
+            for (View view: jenkins.getViews()) {
+                if (view instanceof ListView) {
+                    renameViewItem(oldFullName, newFullName, jenkins, (ListView) view);
+                }
+            }
+            for (Item g : jenkins.allItems()) {
+                if (g instanceof ViewGroup) {
+                    ViewGroup vg = (ViewGroup) g;
+                    for (View v : vg.getViews()) {
+                        if (v instanceof ListView) {
+                            renameViewItem(oldFullName, newFullName, vg, (ListView) v);
+                        }
+                    }
+                }
+            }
+        }
+
+        private void renameViewItem(String oldFullName, String newFullName, ViewGroup vg, ListView lv) {
+            boolean needsSave;
+            synchronized (lv) {
+                Set<String> oldJobNames = new HashSet<String>(lv.jobNames);
+                lv.jobNames.clear();
+                for (String oldName : oldJobNames) {
+                    lv.jobNames.add(Items.computeRelativeNamesAfterRenaming(oldFullName, newFullName, oldName, vg.getItemGroup()));
+                }
+                needsSave = !oldJobNames.equals(lv.jobNames);
+            }
+            if (needsSave) { // do not hold ListView lock at the time
+                try {
+                    lv.save();
+                } catch (IOException x) {
+                    Logger.getLogger(ListView.class.getName()).log(Level.WARNING, null, x);
+                }
+            }
+        }
+
+        @Override
+        public void onDeleted(final Item item) {
+            try (ACLContext _ = ACL.as(ACL.SYSTEM)) {
+                deleted(item);
+            }
+        }
+        private void deleted(Item item) {
+            final Jenkins jenkins = Jenkins.getInstance();
+            for (View view: jenkins.getViews()) {
+                if (view instanceof ListView) {
+                    deleteViewItem(item, jenkins, (ListView) view);
+                }
+            }
+            for (Item g : jenkins.allItems()) {
+                if (g instanceof ViewGroup) {
+                    ViewGroup vg = (ViewGroup) g;
+                    for (View v : vg.getViews()) {
+                        if (v instanceof ListView) {
+                            deleteViewItem(item, vg, (ListView) v);
+                        }
+                    }
+                }
+            }
+        }
+
+        private void deleteViewItem(Item item, ViewGroup vg, ListView lv) {
+            boolean needsSave;
+            synchronized (lv) {
+                needsSave = lv.jobNames.remove(item.getRelativeNameFrom(vg.getItemGroup()));
+            }
+            if (needsSave) {
+                try {
+                    lv.save();
+                } catch (IOException x) {
+                    Logger.getLogger(ListView.class.getName()).log(Level.WARNING, null, x);
+                }
+            }
+        }
+    }
+
 }

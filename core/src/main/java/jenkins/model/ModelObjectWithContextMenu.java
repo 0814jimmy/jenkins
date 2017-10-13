@@ -6,7 +6,6 @@ import hudson.model.Action;
 import hudson.model.Actionable;
 import hudson.model.BallColor;
 import hudson.model.Computer;
-import hudson.model.Item;
 import hudson.model.Job;
 import hudson.model.ModelObject;
 import hudson.model.Node;
@@ -58,8 +57,8 @@ public interface ModelObjectWithContextMenu extends ModelObject {
 
     /**
      * Data object that represents the context menu.
-     * 
-     * Via {@link HttpResponse}, this class is capable of converting itself to JSON that &lt;l:breadcrumb/> understands.
+     *
+     * Via {@link HttpResponse}, this class is capable of converting itself to JSON that {@code <l:breadcrumb/>} understands.
      */
     @ExportedBean
     public class ContextMenu implements HttpResponse {
@@ -83,8 +82,14 @@ public interface ModelObjectWithContextMenu extends ModelObject {
                 add(a);
             return this;
         }
-        
+
+        /**
+         * @see ContextMenuVisibility
+         */
         public ContextMenu add(Action a) {
+            if (!Functions.isContextMenuVisible(a)) {
+                return this;
+            }
             StaplerRequest req = Stapler.getCurrentRequest();
             String text = a.getDisplayName();
             String base = Functions.getIconFilePath(a);
@@ -95,7 +100,7 @@ public interface ModelObjectWithContextMenu extends ModelObject {
 
             return add(url,icon,text);
         }
-        
+
         public ContextMenu add(String url, String icon, String text) {
             if (text != null && icon != null && url != null)
                 items.add(new MenuItem(url,icon,text));
@@ -175,7 +180,7 @@ public interface ModelObjectWithContextMenu extends ModelObject {
          * 
          * <p>
          * This method uses {@code sidepanel.groovy} to run the side panel generation, captures
-         * the use of &lt;l:task> tags, and then converts those into {@link MenuItem}s. This is
+         * the use of {@code <l:task>} tags, and then converts those into {@link MenuItem}s. This is
          * supposed to make this work with most existing {@link ModelObject}s that follow the standard
          * convention.
          * 
@@ -209,7 +214,7 @@ public interface ModelObjectWithContextMenu extends ModelObject {
             } else
             if (self instanceof Actionable) {
                 // fallback
-                this.addAll(((Actionable)self).getActions());
+                this.addAll(((Actionable)self).getAllActions());
             }
     
             return this;
@@ -314,4 +319,22 @@ public interface ModelObjectWithContextMenu extends ModelObject {
             return withDisplayName(o.getDisplayName());
         }
     }
+
+    /**
+     * Allows an action to decide whether it will be visible in a context menu.
+     * @since 1.538
+     */
+    interface ContextMenuVisibility extends Action {
+
+        /**
+         * Determines whether to show this action right now.
+         * Can always return false, for an action which should never be in the context menu;
+         * or could examine {@link Stapler#getCurrentRequest}.
+         * @return true to display it, false to hide
+         * @see ContextMenu#add(Action)
+         */
+        boolean isVisible();
+
+    }
+
 }
